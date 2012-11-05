@@ -140,11 +140,11 @@ module Paperclip
       return super unless @has_faces
 
       scale, crop = @current_geometry.transformation_to(@target_geometry, crop?)
+      crop = "#{crop.split('+').first}+0+0"
       faces_crop = "%dx%d+%d+%d" % [@faces_width, @faces_height, @top_left_x, @top_left_y]
 
       trans = []
-      trans << "-crop" << %["#{faces_crop}"]
-      trans << "+repage" unless crop
+      trans << "-crop" << %["#{faces_crop}"] << "+repage"
       trans << "-resize" << %["#{scale}"] unless scale.nil? || scale.empty?
       trans << "-crop" << %["#{crop}"] << "+repage" if crop
 
