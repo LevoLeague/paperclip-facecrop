@@ -4,9 +4,11 @@ module Paperclip
   class FaceCrop < Paperclip::Thumbnail
 
     @@debug = false
+    @@max_scale_out = 2.5
 
     #cattr_accessor :classifiers
     cattr_accessor :debug
+    cattr_accessor :max_scale_out
 
     def self.detectors=(detectors)
       @@detectors = detectors.map do |name, options|
@@ -18,7 +20,7 @@ module Paperclip
 
     def initialize(file, options = {}, attachment = nil)
       super(file, options, attachment)
-
+      @source_geometry = (options[:file_geometry_parser] || Paperclip::Geometry).from_file(file)
 
       raise "No detectors were defined" if @@detectors.nil?
 
@@ -44,7 +46,6 @@ module Paperclip
         heights << region.height
       end
 
-
       @has_faces = faces_regions.size > 0
 
       if @has_faces
@@ -53,71 +54,15 @@ module Paperclip
         @bottom_right_x = x_coords.max
         @bottom_right_y = y_coords.max
 
+        @bound_geometry = Paperclip::Geometry.new(@bottom_right_x - @top_left_x, @bottom_right_y - @top_left_y)
 
+        @top_padding_available = @top_left_y
+        @bottom_padding_available = @source_geometry.height - @bottom_right_y
+        @max_y_padding = [@top_padding_available,@bottom_padding_available].min
 
-        #puts @top_left_x.to_s
-
-        # average faces areas
-        average_face_width  = widths.sum / widths.size
-        average_face_height = heights.sum / heights.size
-
-        # calculating the surrounding margin of the area that covers all the found faces
-        #
-
-        # new width
-        @top_left_x -= average_face_width / 1.2
-        @bottom_right_x += average_face_width / 1.2
-
-
-        # new height
-        #puts ":::#{@top_left_x}---#{average_face_width}"
-        #return
-
-        @top_left_y -= average_face_height / 1.2
-        @bottom_right_y += average_face_height / 1.2
-
-
-        calculate_bounds
-
-
-
-        # if the new area is smaller than the target geometry, it's scaled so the final image isn't resampled
-        #
-        if @faces_width < @target_geometry.width
-          delta_width = (@target_geometry.width - @faces_width) / 2
-          @top_left_x -= delta_width
-          @bottom_right_x += delta_width
-          calculate_bounds
-        end
-
-        # scale the image so the cropped image still displays the faces
-        if @faces_width > @target_geometry.width && crop?
-          ratio = @faces_width / @target_geometry.width
-          @faces_height = @target_geometry.height * ratio
-        end
-
-        #raise (@target_geometry.height > 0 and @faces_height < @target_geometry.height).to_s
-
-        if (@target_geometry.height > 0 and @faces_height < @target_geometry.height)
-          delta_height = (@target_geometry.height - @faces_height) / 2
-          @top_left_y -= delta_height
-          @bottom_right_y += delta_height
-          calculate_bounds
-        end
-
-
-        #fix image position for extrem aspect ratios
-        if @target_geometry.width / @target_geometry.height < 0.6
-          @top_left_x = x_coords.min * 1.2
-        end
-
-        if @target_geometry.width / @target_geometry.height > 1.4
-          @top_left_y = y_coords.min * 1.2
-        end
-
-        @faces_height = @faces_width if @target_geometry.height == 0
-
-        @current_geometry = Paperclip::Geometry.new(@faces_width, @faces_height)
+        @left_padding_available = @top_left_x
+        @right_padding_available = @source_geometry.width - @bottom_right_x
+        @max_x_padding = [@left_padding_available,@right_padding_available].min
 
         if @@debug
           parameters = []
@@ -139,31 +84,81 @@ module Paperclip
     def transformation_command
       return super unless @has_faces
 
-      scale, crop = @current_geometry.transformation_to(@target_geometry, crop?)
-      crop = "#{crop.split('+').first}+0+0"
-      faces_crop = "%dx%d+%d+%d" % [@faces_width, @faces_height, @top_left_x, @top_left_y]
+      # puts "TL: #{@top_left_x},#{@top_left_y}"
+      # puts "BR: #{@bottom_right_x},#{@bottom_right_y}"
+      # puts "BG: #{@bound_geometry} @ #{@top_left_x},#{@top_left_y}"
 
+      # pad as much as possible toward aspect ratio
+
+      width_padding = height_padding = 0
+
+      if @bound_geometry.aspect > @target_geometry.aspect
+        needed_y_padding = (@target_geometry.aspect * @bound_geometry.width - @bound_geometry.height) / 2
+        if needed_y_padding > @max_y_padding
+          height_padding = @max_y_padding
+        else
+          height_padding = needed_y_padding
+        end
+      elsif @bound_geometry.aspect < @target_geometry.aspect
+        needed_x_padding = (@target_geometry.aspect * @bound_geometry.height - @bound_geometry.width) / 2
+        if needed_x_padding > @max_x_padding
+          width_padding = @max_x_padding
+        else
+          width_padding = needed_x_padding
+        end
+      end
+
+      # scale out as much as possible but not more than max
+
+      padded_geometry = Paperclip::Geometry.new(@bound_geometry.width + 2*width_padding,@bound_geometry.height + 2*height_padding)
+      padded_x = @top_left_x - width_padding
+      padded_y = @top_left_y - height_padding
+      # puts "PG: #{padded_geometry} @ #{padded_x},#{padded_y}"
+
+      left_extra_padding_available = padded_x
+      right_extra_padding_available = @source_geometry.width - @bottom_right_x - width_padding
+      max_extra_x_padding = [left_extra_padding_available,right_extra_padding_available].min
+
+      top_extra_padding_available = padded_y
+      bottom_extra_padding_available = @source_geometry.height - @bottom_right_y - height_padding
+      max_extra_y_padding = [top_extra_padding_available,bottom_extra_padding_available].min
+
+      # puts "ME: #{max_extra_x_padding},#{max_extra_y_padding}"
+
+      if (max_extra_x_padding / padded_geometry.aspect) > max_extra_y_padding
+        max_scaled_x_padding = max_extra_y_padding * padded_geometry.aspect
+        max_scaled_y_padding = max_extra_y_padding
+      else
+        max_scaled_x_padding = max_extra_x_padding
+        max_scaled_y_padding = max_extra_x_padding / padded_geometry.aspect
+      end
+
+      # puts "MS: #{max_scaled_x_padding},#{max_scaled_y_padding}"
+
+      if ((max_scaled_x_padding * 2 + padded_geometry.width) / padded_geometry.width) > @@max_scale_out
+        max_scaled_x_padding = (@@max_scale_out * padded_geometry.width - padded_geometry.width) / 2
+        max_scaled_y_padding = (@@max_scale_out * padded_geometry.height - padded_geometry.height) / 2
+      end
+
+      # puts "MS-max: #{max_scaled_x_padding},#{max_scaled_y_padding}"
+
+      # set geometry of first crop
+
+      cropped_geometry = Paperclip::Geometry.new(padded_geometry.width + 2*max_scaled_x_padding, padded_geometry.height + 2*max_scaled_y_padding)
+      cropped_x = padded_x - max_scaled_x_padding
+      cropped_y = padded_y - max_scaled_y_padding
+
+      faces_crop = "%dx%d+%d+%d" % [cropped_geometry.width, cropped_geometry.height, cropped_x, cropped_y]
       trans = []
       trans << "-crop" << %["#{faces_crop}"] << "+repage"
+
+      # transform first crop to our target
+
+      scale, crop = cropped_geometry.transformation_to(@target_geometry, crop?)
       trans << "-resize" << %["#{scale}"] unless scale.nil? || scale.empty?
       trans << "-crop" << %["#{crop}"] << "+repage" if crop
 
       trans
-    end
-
-    private
-
-    # calculate_bounds
-    #
-    def calculate_bounds
-      @top_left_x = 0 if @top_left_x < 0
-      @bottom_right_x = @current_geometry.width if @bottom_right_x > @current_geometry.width
-
-      @top_left_y = 0 if @top_left_y < 0
-      @bottom_right_y = @current_geometry.height if @bottom_right_y > @current_geometry.height
-
-      @faces_width = @bottom_right_x - @top_left_x
-      @faces_height = @bottom_right_y - @top_left_y
     end
 
   end
